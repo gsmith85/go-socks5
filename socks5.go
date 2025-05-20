@@ -6,13 +6,21 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/context"
+	"slices"
 )
 
 const (
 	socks5Version = uint8(5)
 )
+
+// ErrServerClosed is returned by the Server's Serve, ListenAndServe,
+// and ServeConn methods after a call to Shutdown.
+var ErrServerClosed = fmt.Errorf("socks5: Server closed")
 
 // Config is used to setup and configure a Server
 type Config struct {
@@ -55,6 +63,13 @@ type Config struct {
 type Server struct {
 	config      *Config
 	authMethods map[uint8]Authenticator
+	
+	// Fields for graceful shutdown
+	inShutdown   atomic.Bool
+	mu           sync.Mutex
+	listeners    []net.Listener
+	activeConns  sync.Map
+	listenerDone chan struct{}
 }
 
 // New creates a new Server and potentially returns an error
@@ -84,7 +99,8 @@ func New(conf *Config) (*Server, error) {
 	}
 
 	server := &Server{
-		config: conf,
+		config:       conf,
+		listenerDone: make(chan struct{}),
 	}
 
 	server.authMethods = make(map[uint8]Authenticator)
@@ -98,6 +114,9 @@ func New(conf *Config) (*Server, error) {
 
 // ListenAndServe is used to create a listener and serve on it
 func (s *Server) ListenAndServe(network, addr string) error {
+	if s.inShutdown.Load() {
+		return ErrServerClosed
+	}
 	l, err := net.Listen(network, addr)
 	if err != nil {
 		return err
@@ -107,18 +126,47 @@ func (s *Server) ListenAndServe(network, addr string) error {
 
 // Serve is used to serve connections from a listener
 func (s *Server) Serve(l net.Listener) error {
+	if s.inShutdown.Load() {
+		return ErrServerClosed
+	}
+	
+	s.mu.Lock()
+	s.listeners = append(s.listeners, l)
+	s.mu.Unlock()
+	
+	defer func() {
+		s.mu.Lock()
+		for i, ln := range s.listeners {
+			if ln == l {
+				s.listeners = slices.Delete(s.listeners, i, i+1)
+			}
+		}
+		s.mu.Unlock()
+	}()
+	
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			if s.inShutdown.Load() {
+				return ErrServerClosed
+			}
 			return err
 		}
-		go s.ServeConn(conn)
+		connID := fmt.Sprintf("%p", conn)
+		s.activeConns.Store(connID, conn)
+		go func() {
+			s.ServeConn(conn)
+			s.activeConns.Delete(connID)
+		}()
 	}
-	return nil
 }
 
 // ServeConn is used to serve a single connection.
 func (s *Server) ServeConn(conn net.Conn) error {
+	if s.inShutdown.Load() {
+		conn.Close()
+		return ErrServerClosed
+	}
 	defer conn.Close()
 	bufConn := bufio.NewReader(conn)
 
@@ -166,4 +214,63 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	}
 
 	return nil
+}
+
+// Shutdown gracefully shuts down the server without interrupting any
+// active connections. Shutdown works by first closing all open
+// listeners, then waiting for all active connections to complete.
+// If the provided context expires before the shutdown is complete,
+// Shutdown returns the context's error, otherwise it returns any
+// error returned from closing the Server's underlying Listener(s).
+//
+// When Shutdown is called, Serve, ListenAndServe, and ServeConn
+// immediately return ErrServerClosed. Make sure the program doesn't
+// exit and waits instead for Shutdown to return.
+//
+// Once Shutdown has been called on a server, it may not be reused;
+// future calls to methods such as Serve will return ErrServerClosed.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.inShutdown.Store(true)
+	
+	// Close all listeners
+	s.mu.Lock()
+	var err error
+	for _, l := range s.listeners {
+		if cerr := l.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	s.listeners = nil
+	s.mu.Unlock()
+	
+	// Wait for active connections to finish
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	
+	for {
+		activeConnections := 0
+		s.activeConns.Range(func(_, _ any) bool {
+			activeConnections++
+			return true
+		})
+		
+		if activeConnections == 0 {
+			return err
+		}
+		
+		select {
+		case <-ctx.Done():
+			// Force close any remaining connections
+			s.activeConns.Range(func(key, value any) bool {
+				if conn, ok := value.(net.Conn); ok {
+					conn.Close()
+				}
+				s.activeConns.Delete(key)
+				return true
+			})
+			return ctx.Err()
+		case <-ticker.C:
+			// Continue waiting
+		}
+	}
 }
