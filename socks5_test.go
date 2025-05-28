@@ -9,6 +9,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 func TestSOCKS5_Connect(t *testing.T) {
@@ -106,5 +108,53 @@ func TestSOCKS5_Connect(t *testing.T) {
 
 	if !bytes.Equal(out, expected) {
 		t.Fatalf("bad: %v", out)
+	}
+}
+
+func TestSOCKS5_Shutdown(t *testing.T) {
+	// Create a server
+	conf := &Config{}
+	server, err := New(conf)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Start listening on a random port
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	go func() {
+		err := server.Serve(l)
+		if err != nil && err != ErrServerClosed {
+			t.Errorf("unexpected serve error: %v", err)
+		}
+	}()
+
+	// Get the server address
+	addr := l.Addr().String()
+
+	// Give the server a moment to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Shutdown with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err = server.Shutdown(ctx)
+	if err != nil {
+		t.Fatalf("unexpected shutdown error: %v", err)
+	}
+
+	// Try to connect after shutdown, should fail
+	_, err = net.Dial("tcp", addr)
+	if err == nil {
+		t.Fatal("expected connection to fail after shutdown")
+	}
+
+	// Try to serve again, should fail with ErrServerClosed
+	err = server.Serve(l)
+	if err != ErrServerClosed {
+		t.Fatalf("expected ErrServerClosed, got: %v", err)
 	}
 }
